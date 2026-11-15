@@ -26,11 +26,17 @@ die() { printf '\n\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 [ -n "${PREFIX:-}" ] && [ -d "$PREFIX/bin" ] || die "Run this inside the Termux app."
 [ "$(uname -m)" = "aarch64" ] || die "Needs a 64-bit ARM phone (aarch64). This one reports $(uname -m)."
 
+# --script-only: refresh just the `miner` command (no packages, no rebuild)
+SCRIPT_ONLY=""
+[ "$1" = "--script-only" ] && { SCRIPT_ONLY=1; shift; }
+
 # ---------------------------------------------------------------- packages
-say "Installing build tools (a few minutes on first run)"
-pkg update -y
-apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold full-upgrade
-pkg install -y clang make autoconf automake libtool binutils libcurl libgmp git screen curl
+if [ -z "$SCRIPT_ONLY" ]; then
+  say "Installing build tools (a few minutes on first run)"
+  pkg update -y
+  apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold full-upgrade
+  pkg install -y clang make autoconf automake libtool binutils libcurl libgmp git screen curl
+fi
 
 mkdir -p "$MDIR/profiles"
 
@@ -47,6 +53,7 @@ ACTIVE_FILE="$MDIR/active"
 SETTINGS="$MDIR/settings.conf"
 SESSION="miner"
 SRC_REPO_FILE="$MDIR/src_repo"
+LOG="$MDIR/miner.log"
 
 PROFILE_KEYS="ALGO POOL WALLET PASS THREADS AFFINITY EXTRA"
 SETTING_KEYS="THREADS AFFINITY WORKER CONF_URL CHECK_MIN"
@@ -130,6 +137,11 @@ cmd_run() {  # the loop that lives inside the screen session
     while kill -0 "$pid" 2>/dev/null; do
       sleep 30
       waited=$((waited + 30))
+      # Keep the log small: past 2 MB, cut it back to the newest ~200 KB.
+      # screen appends to the file, so trimming it in place is safe.
+      if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 2000000 ]; then
+        tail -c 200000 "$LOG" > "$LOG.trim" && cat "$LOG.trim" > "$LOG"; rm -f "$LOG.trim"
+      fi
       if [ -n "$C_CONF_URL" ] && [ "$(active)" = "remote" ] && [ "$waited" -ge $(( ${C_CHECK_MIN:-15} * 60 )) ]; then
         waited=0
         if sync_remote; then echo "[miner] fleet config changed — restarting"; kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; break; fi
@@ -180,7 +192,8 @@ cat <<EOF
 miner — phone mining control
 
   miner start | stop | restart     start/stop the background miner
-  miner log                        watch it (detach: Ctrl+A then D)
+  miner log                        watch it live (detach: Ctrl+A then D)
+  miner tail                       follow the saved log file (Ctrl+C to quit)
   miner status                     what's running and with which settings
   miner add NAME ALGO POOL WALLET [PASS]
                                    save a coin profile
@@ -199,19 +212,29 @@ case "$1" in
   run) cmd_run ;;
   start)
     if running; then echo "Already running. 'miner log' to watch."; exit 0; fi
-    screen -dmS "$SESSION" "$0" run && echo "Started. 'miner log' to watch (Ctrl+A then D to leave it running)." ;;
+    screen -wipe >/dev/null 2>&1
+    rm -f "$LOG.1"
+    screen -L -Logfile "$LOG" -dmS "$SESSION" "$0" run \
+      && echo "Started. 'miner log' to watch live, 'miner tail' for the log file." ;;
   stop)
-    screen -S "$SESSION" -X quit 2>/dev/null; pkill -f "^$BIN " 2>/dev/null
+    screen -S "$SESSION" -X quit 2>/dev/null; pkill -f "^$BIN " 2>/dev/null; screen -wipe >/dev/null 2>&1
     command -v termux-wake-unlock >/dev/null && termux-wake-unlock
     echo "Stopped." ;;
   restart) "$0" stop; sleep 2; "$0" start ;;
-  log|attach) screen -r "$SESSION" || echo "Not running. 'miner start' first." ;;
+  log|attach)
+    screen -wipe >/dev/null 2>&1
+    if running; then screen -d -r "$SESSION"
+    elif [ -f "$LOG" ]; then echo "(no live session — showing the log file; Ctrl+C to quit)"; tail -n 40 -f "$LOG"
+    else echo "Not running. 'miner start' first."; fi ;;
+  tail) [ -f "$LOG" ] && tail -n 40 -f "$LOG" || echo "No log yet. 'miner restart' creates one." ;;
   status)
     if running; then echo "State:   running"; else echo "State:   stopped"; fi
     echo "Profile: $(active)"
     if load_all; then build_cmd; echo "Command: ${CMD[*]}"; else echo "Command: (profile incomplete)"; fi
     [ -n "$C_CONF_URL" ] && echo "Fleet:   $C_CONF_URL (every ${C_CHECK_MIN:-15} min)"
-    [ -x "$BIN" ] && echo "Build:   $("$BIN" --version 2>/dev/null | head -1)" ;;
+    [ -x "$BIN" ] && echo "Build:   $("$BIN" --version 2>/dev/null | head -1)"
+    pgrep -f "^$BIN " >/dev/null && echo "Miner:   process running" || echo "Miner:   process NOT running"
+    [ -f "$LOG" ] && echo "Last:    $(grep -a 'H/s' "$LOG" | tail -1 | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-120)" ;;
   add)
     [ $# -ge 5 ] || { echo "Usage: miner add NAME ALGO POOL WALLET [PASS]"; exit 1; }
     f="$PROF/$2.conf"; : > "$f"
@@ -247,6 +270,12 @@ case "$1" in
 esac
 MINER_EOF
 chmod +x "$CTL"
+
+if [ -n "$SCRIPT_ONLY" ]; then
+  "$CTL" boot on >/dev/null
+  "$CTL" restart >/dev/null
+  say "miner command updated"; "$CTL" status; exit 0
+fi
 
 # ---------------------------------------------------------------- build
 say "Building cpuminer-opt (5–20 minutes on a phone)"
