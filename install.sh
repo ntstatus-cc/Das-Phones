@@ -35,7 +35,7 @@ if [ -z "$SCRIPT_ONLY" ]; then
   say "Installing build tools (a few minutes on first run)"
   pkg update -y
   apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold full-upgrade
-  pkg install -y clang make autoconf automake libtool binutils libcurl libgmp git screen curl
+  pkg install -y clang make autoconf automake libtool binutils libcurl libgmp git curl
 fi
 
 mkdir -p "$MDIR/profiles"
@@ -51,7 +51,7 @@ SRC_DIR="$MDIR/cpuminer-opt"
 PROF="$MDIR/profiles"
 ACTIVE_FILE="$MDIR/active"
 SETTINGS="$MDIR/settings.conf"
-SESSION="miner"
+PIDFILE="$MDIR/run.pid"
 SRC_REPO_FILE="$MDIR/src_repo"
 LOG="$MDIR/miner.log"
 
@@ -83,7 +83,20 @@ setkv() {  # setkv FILE KEY VALUE
   mv "$file.tmp" "$file"
 }
 
-running() { screen -ls 2>/dev/null | grep -q "[0-9]\.${SESSION}[[:space:]]"; }
+# The background loop writes its own PID; check it is still that loop
+# (after a reboot an old PID can belong to some other process).
+running() {
+  local pid; pid="$(cat "$PIDFILE" 2>/dev/null)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
+    && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "miner run"
+}
+miner_up() { pgrep -f "^$BIN " >/dev/null; }
+# Remove anything left by the older screen-based version.
+legacy_cleanup() {
+  if command -v screen >/dev/null; then
+    screen -S miner -X quit >/dev/null 2>&1; screen -wipe >/dev/null 2>&1
+  fi
+}
 active()  { cat "$ACTIVE_FILE" 2>/dev/null; }
 
 load_all() {
@@ -120,25 +133,27 @@ sync_remote() {
   return 0
 }
 
-cmd_run() {  # the loop that lives inside the screen session
-  command -v termux-wake-lock >/dev/null && termux-wake-lock
+cmd_run() {  # the background loop started by 'miner start'
+  echo $$ > "$PIDFILE"
   local pid="" waited
-  # Ctrl+C, 'miner stop' or closing the session also stops the miner process.
-  trap '[ -n "$pid" ] && kill "$pid" 2>/dev/null; exit 0' INT TERM HUP
+  # 'miner stop' (TERM) also stops the cpuminer process.
+  trap '[ -n "$pid" ] && kill "$pid" 2>/dev/null; [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$PIDFILE"; exit 0' INT TERM HUP
+  # termux-wake-lock can hang right after boot; never let it block mining.
+  command -v termux-wake-lock >/dev/null && { timeout 15 termux-wake-lock >/dev/null 2>&1 & }
   while true; do
     sync_remote || true
-    if ! [ -x "$BIN" ]; then echo "[miner] no cpuminer binary yet — run: miner update"; sleep 60; continue; fi
-    if ! load_all; then echo "[miner] no complete profile active — run: miner add / miner use"; sleep 60; continue; fi
+    if ! [ -x "$BIN" ]; then echo "[miner] no cpuminer binary yet — run: miner update"; sleep 60 & wait $!; continue; fi
+    if ! load_all; then echo "[miner] no complete profile active — run: miner add / miner use"; sleep 60 & wait $!; continue; fi
     build_cmd
     echo "[miner] $(date '+%F %T') starting profile '$(active)': ${CMD[*]}"
-    "${CMD[@]}" &
+    "${CMD[@]}" --no-color &
     pid=$!
     waited=0
     while kill -0 "$pid" 2>/dev/null; do
-      sleep 30
+      sleep 30 & wait $!   # interruptible, so 'miner stop' acts at once
       waited=$((waited + 30))
       # Keep the log small: past 2 MB, cut it back to the newest ~200 KB.
-      # screen appends to the file, so trimming it in place is safe.
+      # The log is opened in append mode, so trimming it in place is safe.
       if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 2000000 ]; then
         tail -c 200000 "$LOG" > "$LOG.trim" && cat "$LOG.trim" > "$LOG"; rm -f "$LOG.trim"
       fi
@@ -148,8 +163,8 @@ cmd_run() {  # the loop that lives inside the screen session
       fi
     done
     wait "$pid" 2>/dev/null
-    echo "[miner] $(date '+%F %T') miner exited — restarting in 10 s (Ctrl+C now to stop)"
-    sleep 10
+    echo "[miner] $(date '+%F %T') miner exited — restarting in 10 s"
+    sleep 10 & wait $!
   done
 }
 
@@ -185,6 +200,7 @@ cmd_update() {
   cp "$SRC_DIR/cpuminer" "$BIN.new" && mv "$BIN.new" "$BIN"
   echo "[miner] installed: $("$BIN" --version 2>/dev/null | head -1)"
   if running; then pkill -f "^$BIN " ; echo "[miner] restarted on the new build"; fi
+  return 0
 }
 
 usage() {
@@ -192,8 +208,7 @@ cat <<EOF
 miner — phone mining control
 
   miner start | stop | restart     start/stop the background miner
-  miner log                        watch it live (detach: Ctrl+A then D)
-  miner tail                       follow the saved log file (Ctrl+C to quit)
+  miner log                        watch the miner (Ctrl+C stops watching, not mining)
   miner status                     what's running and with which settings
   miner add NAME ALGO POOL WALLET [PASS]
                                    save a coin profile
@@ -212,28 +227,29 @@ case "$1" in
   run) cmd_run ;;
   start)
     if running; then echo "Already running. 'miner log' to watch."; exit 0; fi
-    screen -wipe >/dev/null 2>&1
-    rm -f "$LOG.1"
-    screen -L -Logfile "$LOG" -dmS "$SESSION" "$0" run \
-      && echo "Started. 'miner log' to watch live, 'miner tail' for the log file." ;;
+    legacy_cleanup; pkill -f "^$BIN " 2>/dev/null; rm -f "$PIDFILE"
+    nohup "$0" run >> "$LOG" 2>&1 < /dev/null &
+    sleep 1
+    if running; then echo "Started. 'miner log' to watch."; else echo "Failed to start. Last log lines:"; tail -n 15 "$LOG"; fi ;;
   stop)
-    screen -S "$SESSION" -X quit 2>/dev/null; pkill -f "^$BIN " 2>/dev/null; screen -wipe >/dev/null 2>&1
-    command -v termux-wake-unlock >/dev/null && termux-wake-unlock
+    pid="$(cat "$PIDFILE" 2>/dev/null)"
+    running && kill "$pid" 2>/dev/null
+    sleep 1; pkill -f "^$BIN " 2>/dev/null; legacy_cleanup; rm -f "$PIDFILE"
+    command -v termux-wake-unlock >/dev/null && timeout 15 termux-wake-unlock >/dev/null 2>&1
     echo "Stopped." ;;
-  restart) "$0" stop; sleep 2; "$0" start ;;
-  log|attach)
-    screen -wipe >/dev/null 2>&1
-    if running; then screen -d -r "$SESSION"
-    elif [ -f "$LOG" ]; then echo "(no live session — showing the log file; Ctrl+C to quit)"; tail -n 40 -f "$LOG"
-    else echo "Not running. 'miner start' first."; fi ;;
-  tail) [ -f "$LOG" ] && tail -n 40 -f "$LOG" || echo "No log yet. 'miner restart' creates one." ;;
+  restart) "$0" stop; sleep 1; "$0" start ;;
+  log|attach|tail)
+    [ -f "$LOG" ] || { echo "No log yet. 'miner start' first."; exit 0; }
+    running || echo "(miner is NOT running — showing the old log. 'miner start' to start it.)"
+    echo "(Ctrl+C stops watching; the miner keeps running)"
+    tail -n 40 -f "$LOG" ;;
   status)
-    if running; then echo "State:   running"; else echo "State:   stopped"; fi
+    if running; then echo "State:   running (loop PID $(cat "$PIDFILE"))"; else echo "State:   stopped"; fi
     echo "Profile: $(active)"
     if load_all; then build_cmd; echo "Command: ${CMD[*]}"; else echo "Command: (profile incomplete)"; fi
     [ -n "$C_CONF_URL" ] && echo "Fleet:   $C_CONF_URL (every ${C_CHECK_MIN:-15} min)"
     [ -x "$BIN" ] && echo "Build:   $("$BIN" --version 2>/dev/null | head -1)"
-    pgrep -f "^$BIN " >/dev/null && echo "Miner:   process running" || echo "Miner:   process NOT running"
+    miner_up && echo "Miner:   cpuminer process running" || echo "Miner:   cpuminer process NOT running"
     [ -f "$LOG" ] && echo "Last:    $(grep -a 'H/s' "$LOG" | tail -1 | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-120)" ;;
   add)
     [ $# -ge 5 ] || { echo "Usage: miner add NAME ALGO POOL WALLET [PASS]"; exit 1; }
@@ -263,7 +279,7 @@ case "$1" in
     mkdir -p "$HOME/.termux/boot"
     if [ "$2" = "off" ]; then rm -f "$HOME/.termux/boot/start-miner"; echo "Boot start off."
     else
-      printf '#!/data/data/com.termux/files/usr/bin/sh\ntermux-wake-lock\nsleep 20\n%s start\n' "$0" > "$HOME/.termux/boot/start-miner"
+      printf '#!/data/data/com.termux/files/usr/bin/sh\n# give Android time to bring up networking\nsleep 30\n%s start >> %s 2>&1\n' "$0" "$LOG" > "$HOME/.termux/boot/start-miner"
       chmod +x "$HOME/.termux/boot/start-miner"; echo "Boot start on (needs the Termux:Boot app opened once)."
     fi ;;
   *) usage ;;

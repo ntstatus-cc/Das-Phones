@@ -28,7 +28,7 @@ The first build takes 5–20 minutes.
 ## Everyday commands
 | Command | What it does |
 |---|---|
-| `miner log` | watch the miner (Ctrl+A then D leaves it running) |
+| `miner log` | watch the miner (Ctrl+C stops watching, mining keeps going) |
 | `miner status` | running or not, active coin, exact command |
 | `miner add ytn yespowerr16 stratum+tcp://POOL:PORT WALLET` | save another coin |
 | `miner use ytn` | switch coins |
@@ -37,5 +37,10 @@ The first build takes 5–20 minutes.
 | `miner update` | rebuild from the newest cpuminer-opt source |
 | `miner stop` / `miner start` | stop / start |
 | `miner algos` | list supported algorithms |
+
+To refresh just the `miner` command after editing install.sh (takes seconds, no rebuild):
+```
+curl -fsSL https://raw.githubusercontent.com/YOU/REPO/main/install.sh -o install.sh && bash install.sh --script-only
+```
 
 To pin a known-good source version: `SRC_REF=<commit> miner update`.
